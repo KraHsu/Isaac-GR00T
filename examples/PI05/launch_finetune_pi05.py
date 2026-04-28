@@ -53,8 +53,8 @@ config.training.dataloader_num_workers = int(os.environ.get("NUM_WORKERS", "4"))
 config.training.learning_rate = 1e-4
 config.training.weight_decay = 1e-5
 config.training.warmup_ratio = 0.05
-config.training.max_steps = int(os.environ.get("MAX_STEPS", "10000"))
-config.training.save_steps = int(os.environ.get("SAVE_STEPS", "1000"))
+config.training.max_steps = int(os.environ.get("MAX_STEPS", "80000"))
+config.training.save_steps = int(os.environ.get("SAVE_STEPS", "10000"))
 config.training.save_total_limit = 5
 config.training.num_gpus = int(os.environ.get("NUM_GPUS", "1"))
 config.training.use_wandb = os.environ.get("USE_WANDB", "0") == "1"

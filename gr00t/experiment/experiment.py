@@ -121,10 +121,13 @@ def run(config: Config):
     if dist.is_initialized():
         global_rank = dist.get_rank()
     elif "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
-        dist.init_process_group(backend="nccl")
         # only meaningful for torchrun, for ray it is always 0
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend="nccl",
+            device_id=torch.device(f"cuda:{local_rank}"),
+        )
         global_rank = dist.get_rank()
     else:
         local_rank = 0

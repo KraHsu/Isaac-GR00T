@@ -10,7 +10,7 @@ importlib.import_module("examples.PI05.pi05_config")
 from gr00t.configs.base_config import get_default_config
 from gr00t.experiment.experiment import run
 
-DATA_ROOT = Path("/home/charles/workspace/PND/pi05/results")
+DATA_ROOT = Path("/home/zch/workspace/results/")
 TASKS = ["flatten", "fold_and_deliver", "takeout", "takeout_and_flatten", "takeout_flatten_fold"]
 
 BASE_MODEL = os.environ.get("BASE_MODEL_PATH", "/home/zch/workspace/GR00T-N1.7-3B")
@@ -30,8 +30,8 @@ config = get_default_config().load_dict({
 })
 config.load_config_path = None
 
-config.model.tune_llm = False
-config.model.tune_visual = False
+config.model.tune_llm = True
+config.model.tune_visual = True
 config.model.tune_projector = True
 config.model.tune_diffusion_model = True
 config.model.state_dropout_prob = 0.2

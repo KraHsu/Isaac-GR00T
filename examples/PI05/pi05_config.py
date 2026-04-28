@@ -33,7 +33,7 @@ pi05_config = {
         modality_keys=["joints"],
     ),
     "action": ModalityConfig(
-        delta_indices=list(range(16)),
+        delta_indices=list(range(32)),
         modality_keys=["joints"],
         action_configs=[
             ActionConfig(

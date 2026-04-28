@@ -11,6 +11,10 @@ export USE_WANDB="${USE_WANDB:-0}"
 export NUM_WORKERS="${NUM_WORKERS:-4}"
 export VIDEO_BACKEND="${VIDEO_BACKEND:-torchcodec}"  # use ffmpeg on dev machine (no torchcodec)
 
+# NCCL 2.26 + driver 570 hits cuMem invalid-argument when importing NVLS
+# fabric handles on HGX H200. NVLink P2P unaffected, only SHARP collectives.
+export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+
 SCRIPT="examples/PI05/launch_finetune_pi05.py"
 
 if [ "$NUM_GPUS" = "1" ]; then

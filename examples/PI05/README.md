@@ -137,6 +137,30 @@ python gr00t/eval/run_gr00t_server.py \
 客户端用 `gr00t.policy.server_client.PolicyClient` 通过 ZMQ 连接,
 详见 `gr00t/policy/server_client.py`。
 
+## ROS2 客户端: 两种执行模式
+
+`examples/PI05/` 提供两个并列的 ROS2 客户端, 取决于服务端推理延迟与任务对反应性的要求:
+
+| 文件 | 模式 | 适用场景 |
+|------|------|---------|
+| [`client_groot.py`](client_groot.py) | **RTC 异步** (frozen prefix + soft-mask blending) | 服务端延迟 < 300ms; 需要高反应性的 manipulation |
+| [`client_groot_sync.py`](client_groot_sync.py) | **同步执行** (推理 → 整 chunk 跑完 → 推理) | 服务端延迟 ≥ 500ms; 任务节奏慢; 想要可预测轨迹 |
+
+两个客户端**完全自包含**, 共用相同的: ZMQ + msgpack 协议、ROS 话题、KP/KD、安全限位、
+关节滑率限幅 (`--max-arm-velocity`)、JSONL 日志格式、依赖 (仅 `pyzmq + msgpack + numpy`)。
+
+### 决策树
+
+```
+服务端推理延迟 (单次 get_action 耗时, 含网络) 是多少?
+├─ < 200ms                → RTC 异步 (client_groot.py)            ★ 最佳反应性
+├─ 200~500ms 且能调小 s   → RTC 异步 + --execution-horizon 5      ✓ 折中
+├─ ≥ 500ms 或难以下调      → 同步执行 (client_groot_sync.py)      ★ 简单可控
+└─ 任务节奏极慢/调试录制  → 同步执行                              ★ 可预测
+```
+
+如果不确定, 先用 `--debug` 跑一遍 RTC 客户端看 `latency_ema_ms`, 再决定是否切到同步版。
+
 ## ROS2 客户端 (RTC)
 
 `examples/PI05/client_groot.py` 是机器人侧的 ROS2 客户端, 复用 Physical
@@ -195,6 +219,7 @@ python examples/PI05/client_groot.py \
 | `--blend-schedule` | `exp` | RTC 软掩码衰减: `exp` / `linear` / `ones` |
 | `--max-guidance-weight` | `10.0` | β: 指数衰减权重上限 (论文推荐 5~10) |
 | `--interpolation-factor` | `10` | N: 伺服频率 = `control_hz × N`; `1` 关闭插值 |
+| `--max-arm-velocity` | `3.0` | **输出层关节滑率限幅 (rad/s)**, 兜底防跳变。每个 servo tick 单关节 \|Δq\| ≤ `max_arm_velocity / servo_hz`; ≤0 关闭 |
 | `--render-size` | `0` | 客户端预 letterbox 缩放尺寸; `0` = 不缩放 (推荐) |
 | `--debug` | `false` | 启用后跑完整推理但不发布 `lowcmd`/`handcmd`, 用于联调 |
 | `--json-log-path` | `logs/groot_rtc_trace_<ts>.jsonl` | JSONL 事件日志路径 |
@@ -209,6 +234,35 @@ ROS 话题默认值 (覆盖请用对应的 `--*-topic` 参数):
 | `--handstate-topic` | `handstate` | 订阅 |
 | `--lowcmd-topic` | `lowcmd` | 发布 |
 | `--handcmd-topic` | `handcmd` | 发布 |
+
+### 输出层兜底防跳变 (slew-rate limiter)
+
+模型偶发输出大幅跳变时, 仅靠 RTC 融合 / 插值不足以兜住。客户端在 `_apply_action`
+里加了一道**关节滑率限幅**, 直接卡住每个 servo tick 上单关节相对上次发布值的最大
+位移:
+
+```
+|Δq_per_tick| ≤ max_arm_velocity / (control_hz × interpolation_factor)
+```
+
+默认 `--max-arm-velocity 3.0` rad/s, 在 `control_hz=15 × interp=10 = 150 Hz` 下:
+单关节每 tick 最多动 **0.02 rad ≈ 1.15°**, 单 control 帧最多动 **0.2 rad ≈ 11.5°**。
+正常 manipulation 远低于此阈值 (训练数据典型 < 0.5 rad/s), 但能彻底吃掉 chunk
+首动作的开机瞬跳与异常值。
+
+特性:
+
+- **首次发布会从当前关节状态 (`lowstate`) 锚定起点**, 因此第一帧不会从默认 0 跳到模型目标
+- **限幅是闭环式**: 下一个 tick 的"上次发布值"是已被限幅的指令值, 输入持续偏离时输出会以最大斜率追赶, 不会突变也不会过冲
+- **触发时会打日志**: 首次触发 WARN, 之后每 5 秒若窗口限幅率 >0.5% 再 WARN 一次, 提示 policy 输出存在跳变
+- **手部二值动作不受影响** (slew 只管 19 维手臂)
+- **设 `--max-arm-velocity 0` 关闭**(用于 A/B 对比或调试)
+
+调参建议: 看到 `slew limiter active: X%` 频繁出现且 X 较高(如 >20%), 说明限幅已成
+为主导因素而非"兜底", 此时:
+1. 先确认是否模型本身输出有问题(看 `RTC 推理完成 ... action_range`)
+2. 适度放宽 `--max-arm-velocity`(例如 5.0)
+3. 或增大 `--interpolation-factor` 让动作分布到更多 tick(每 tick 步长更小)
 
 ### Debug 模式
 
@@ -244,6 +298,81 @@ KP/KD、安全限位、控制循环插值与 JSONL 日志格式; 仅推理协议
 `control_action`, `session_end`), 只是默认文件名为
 `logs/groot_rtc_trace_<时间戳>.jsonl` 且 `session_start.model="gr00t-n1d7-pi05"`。
 现有针对 `openpi_rtc_trace_*.jsonl` 的离线可视化脚本可直接复用。
+
+## ROS2 客户端 (同步执行)
+
+`examples/PI05/client_groot_sync.py` 是不带 RTC 的同步执行版客户端, 走最朴素的循环:
+
+```
+while True:
+    ① 拍下当前 state + image
+    ② 调服务端 get_action(obs) 阻塞等推理 (~700ms)
+    ③ 把整个 chunk 顺序按 control_hz 执行完 (~2.13s @ H=32, 15Hz)
+    ④ 回到 ①
+```
+
+推理期间机器人**保持上一帧指令**(在 PD 控制下基本静止), 整 chunk 执行完才进下一次推理。
+配置直观, 完全没有 RTC 调参 (没有 `--execution-horizon` / `--blend-schedule` /
+`--max-guidance-weight`); 推理延迟再高也只是**整体节奏变慢**, 不会出现硬切跳变。
+
+### 启动命令
+
+```bash
+python examples/PI05/client_groot_sync.py \
+    --host 192.168.31.116 --port 5555 \
+    --prompt "fold the white T-shirt" \
+    --action-horizon 32 --interpolation-factor 10
+```
+
+### 关键参数 (相对 RTC 客户端的差集)
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--action-horizon` | `32` | 每次推理执行的 chunk 步数 |
+| `--timeout-ms` | `30000` | ZMQ 超时 (默认 30s, 同步模式宽松一些以容忍高延迟服务端) |
+| `--max-arm-velocity` | `3.0` | 输出层关节滑率限幅, 与 RTC 客户端共用 |
+| 其它 (`--host` / `--port` / `--prompt` / `--control-hz` / `--interpolation-factor` / `--render-size` / `--debug`) | 同 RTC 客户端 | |
+
+**没有**这些 RTC-only 参数: `--execution-horizon`, `--blend-schedule`, `--max-guidance-weight`。
+
+### 执行节奏可视化 (默认参数)
+
+```
+推理   |--700ms--|                                    |--700ms--|
+chunk          [───────── 2133ms execute ─────────][───────── 2133ms execute ─────────]
+机器人 静止/PD保持        匀速跟踪                          匀速跟踪
+                ↑                                    ↑
+              首动作                              chunk 切换
+              从 state 起步 + slew limit          跨 chunk 线性插值 + slew limit
+```
+
+总循环周期 ≈ `H × Δt + inference_latency` = `2.13s + 0.7s ≈ 2.83s`。
+**每次推理之间机器人有约 700ms / 25% 的静止时间**, 这是同步模式的本质代价。
+
+减小 `--action-horizon` (例如 `16`) 可缩短停顿占比, 但会增加推理频率与服务端压力:
+
+| H | execute 时长 | 停顿占比 (700ms 推理) |
+|---|------------|----------------------|
+| 32 | 2.13s | 25% |
+| 16 | 1.07s | 40% |
+| 8  | 0.53s | 57% |
+
+### 同步模式 vs RTC 模式行为对比
+
+| 行为 | RTC (`client_groot.py`) | 同步 (`client_groot_sync.py`) |
+|------|-------------------------|-------------------------------|
+| 推理与执行 | **重叠** 进行 | **串行**, 推理时机器人停顿 |
+| chunk 边界 | frozen prefix + soft mask 平滑 | 跨 chunk 线性插值 + slew limit |
+| 高延迟下表现 | 边界硬切, 需调参 | 节奏变慢但无跳变, **零调参** |
+| 反应性 | 高 (每 s 步重看一次画面) | 低 (每 H 步才重看) |
+| 配置参数数量 | 多 (s / blend / β / d) | 少 (无) |
+| 适合调试 / 录 demo | 一般 (轨迹依赖时序) | 优 (轨迹完全可重现) |
+
+### JSONL 日志
+
+事件类型: `session_start` / `sync_inference` (替代 `rtc_inference`) / `control_action` /
+`session_end`。每条 `control_action` 带 `chunk_index` + `step_in_chunk`, 方便离线还原 chunk
+切换边界。`session_start.mode = "sync"`, 与 RTC 模式区分。
 
 ## 排错
 

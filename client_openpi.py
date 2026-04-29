@@ -1,158 +1,67 @@
 #!/usr/bin/env python3
-"""ROS2 GR00T 客户端 — Real-Time Chunking (RTC) 版本
+"""ROS2 OpenPI 客户端 — Real-Time Chunking (RTC) 版本
 =======================================================
 
-PI05 微调后的 GR00T N1.7 3B 推理服务的 ROS2 客户端, 复用 Physical
-Intelligence 提出的 RTC 执行模式 (frozen prefix + soft-mask blending),
-异步推理 + 动作队列融合, 与 ``client_openpi.py`` 行为一致, 仅替换
-推理服务端协议与观测/动作格式。
+实现 Physical Intelligence 提出的 RTC 执行模式：
+  https://www.pi.website/research/real_time_chunking
+  论文: https://arxiv.org/abs/2506.07339
 
-本文件 **完全自包含**, 机器人侧只需 ``pyzmq + msgpack + numpy + rclpy``,
-不必安装 gr00t 包及其重型依赖 (torch / transformers / flash-attn / 等)。
+─── 与原始同步 / skip-actions 方案的核心区别 ───
 
-─── 与 ``client_openpi.py`` 的核心差异 ───
+1. 真正的异步推理
+   推理线程在机器人执行当前 chunk 的 *同时* 就开始生成下一个 chunk，
+   不再等 chunk 执行完才调用模型。
 
-1. 协议:  WebSocket → ZeroMQ REQ/REP, msgpack 序列化
-   连接 ``gr00t/eval/run_gr00t_server.py`` 启动的 ``PolicyServer``;
-   ZMQ + msgpack 协议在文件顶部内联实现 (与 PolicyServer 双向兼容)。
+2. 执行窗口 (execution_horizon, 记作 s)
+   每个 chunk 只执行 s 步就触发新推理（而非执行完全部 H 步）。
+   s 远小于 H，因此新旧 chunk 有大量重叠。
 
-2. 观测格式: 必须包含 batch + temporal 维度
-     {
-       "video":    {"zed_rgb": uint8 (1, 1, H, W, 3)},
-       "state":    {"joints":  float32 (1, 1, 21)},
-       "language": {"annotation.human.task_description": [["..."]]},
-     }
+3. 冻结前缀 + 软掩码融合 (frozen prefix + soft-mask blending)
+   新 chunk 到达时，其前 d 步（推理延迟）被 *冻结* 为旧 chunk 对应值；
+   剩余重叠区域用指数衰减权重平滑混合：
+     blended[i] = w[i] * prev[i] + (1 - w[i]) * new[i]
+   彻底消除 chunk 边界的跳变和暂停。
 
-3. 动作格式:  client.get_action(obs) → (action_dict, info)
-   PI05 输出 ``action_dict["joints"]`` shape=(1, 32, 21), 取 [0] 喂给
-   RTC 队列即可, 其它环节完全不变。
-
-4. 图像预处理: GR00T 服务端的 processor 内部会自动 resize, 客户端
-   默认直接发原始相机图像 (HWC uint8); 如需节省带宽可用 ``--render-size``
-   做 letterbox 缩放。
+4. 动作队列 (ActionQueue)
+   专用 FIFO 队列解耦推理与执行，控制循环严格按固定频率弹出动作。
 
 ─── 术语对照 (与 RTC 论文一致) ───
 
-  H  = action_horizon      模型输出的 chunk 总长度 (PI05 默认 H=32)
-  s  = execution_horizon    每次推理之间实际执行的步数 (默认 s=15)
-  d  = inference_delay      推理耗时对应的控制步数, 自动估算
-  Δt = 1/control_hz         控制周期 (默认 ~67ms, 即 15Hz)
+  H  = action_horizon      模型输出的 chunk 总长度 (本项目中 H=32)
+  s  = execution_horizon    每次推理之间实际执行的步数 (默认 s=10)
+  d  = inference_delay      推理耗时对应的控制步数，自动估算
+  Δt = 1/control_hz         控制周期 (默认 20ms, 即 50Hz)
 """
 
 from __future__ import annotations
 
 import argparse
-from collections import deque
-import io
 import json
 import logging
 import math
 import os
-from pathlib import Path
 import threading
 import time
+from collections import deque
+from pathlib import Path
 from typing import Any
 
-import msgpack
 import numpy as np
-from pnd_adam.msg import HandCmd, HandState, LowCmd, LowState, MotorCmd
 import rclpy
+from pnd_adam.msg import HandCmd, HandState, LowCmd, LowState, MotorCmd
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
-import zmq
 
-
-# ═══════════════════════════════════════════════════════════════════
-#  内联 ZMQ + msgpack 协议
-# ═══════════════════════════════════════════════════════════════════
-#
-#  与 gr00t/policy/server_client.py 中的 PolicyServer 双向兼容。
-#  仅实现客户端真正用到的两个端点 (ping / get_action), 避免拉入
-#  gr00t 包及其重型依赖 (torch / transformers / flash-attn / 等)。
-#  机器人侧只需: pyzmq + msgpack + numpy (+ ROS distro 自带 rclpy)。
-
-
-def _ndarray_pack(obj: object) -> object:
-    """msgpack default 钩子: 把 numpy ndarray 序列化为 .npy bytes。"""
-    if isinstance(obj, np.ndarray):
-        buf = io.BytesIO()
-        np.save(buf, obj, allow_pickle=False)
-        return {"__ndarray_class__": True, "as_npy": buf.getvalue()}
-    raise TypeError(f"Unsupported type: {type(obj)}")
-
-
-def _ndarray_unpack(obj: dict) -> object:
-    """msgpack object_hook: 还原 ndarray; ModalityConfig 字段不解析直接保留。"""
-    if not isinstance(obj, dict):
-        return obj
-    if obj.get("__ndarray_class__"):
-        return np.load(io.BytesIO(obj["as_npy"]), allow_pickle=False)
-    return obj
-
-
-class GrootZmqClient:
-    """轻量级 ZeroMQ REQ 客户端, 与 gr00t.policy.server_client.PolicyServer 兼容。
-
-    仅实现 ping / get_action 两个端点; 故意不调 get_modality_config 以
-    避开服务端返回 ModalityConfig 实例时的反序列化问题 (ModalityConfig
-    需要 gr00t.data.types, 我们这里不引入)。
-    """
-
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        timeout_ms: int = 15000,
-        api_token: str | None = None,
-    ) -> None:
-        self.host = host
-        self.port = port
-        self.timeout_ms = timeout_ms
-        self.api_token = api_token
-        self.context = zmq.Context.instance()
-        self._init_socket()
-
-    def _init_socket(self) -> None:
-        self.socket = self.context.socket(zmq.REQ)
-        self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
-        self.socket.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
-        self.socket.connect(f"tcp://{self.host}:{self.port}")
-
-    def _call(self, endpoint: str, data: dict | None = None) -> object:
-        request: dict = {"endpoint": endpoint}
-        if data is not None:
-            request["data"] = data
-        if self.api_token:
-            request["api_token"] = self.api_token
-        try:
-            self.socket.send(msgpack.packb(request, default=_ndarray_pack))
-            message = self.socket.recv()
-        except zmq.error.Again:
-            # 超时: REQ socket 进入坏状态, 重建后再上抛
-            self._init_socket()
-            raise
-        if message == b"ERROR":
-            raise RuntimeError("Server error.")
-        response = msgpack.unpackb(message, object_hook=_ndarray_unpack)
-        if isinstance(response, dict) and "error" in response:
-            raise RuntimeError(f"Server error: {response['error']}")
-        return response
-
-    def ping(self) -> dict:
-        return self._call("ping")  # type: ignore[return-value]
-
-    def get_action(self, observation: dict, options: dict | None = None) -> tuple[dict, dict]:
-        response = self._call("get_action", {"observation": observation, "options": options})
-        # 服务端返回 (action_dict, info_dict); msgpack 解出来是 list
-        return tuple(response)  # type: ignore[return-value]
-
-    def close(self) -> None:
-        try:
-            self.socket.close(linger=0)
-        except Exception:  # pragma: no cover
-            pass
-
+try:
+    from openpi_client import image_tools
+    from openpi_client import websocket_client_policy
+except ImportError as exc:  # pragma: no cover
+    image_tools = None
+    websocket_client_policy = None
+    OPENPI_IMPORT_ERROR = exc
+else:
+    OPENPI_IMPORT_ERROR = None
 
 # ┌──────────────────────────────────────────────────────────────────┐
 # │                        维度常量                                  │
@@ -177,21 +86,12 @@ DEFAULT_LOWSTATE_TOPIC = "lowstate"
 DEFAULT_HANDSTATE_TOPIC = "handstate"
 DEFAULT_LOWCMD_TOPIC = "lowcmd"
 DEFAULT_HANDCMD_TOPIC = "handcmd"
-DEFAULT_HOST = "192.168.31.116"
-DEFAULT_PORT = 5555  # GR00T 服务端默认端口 (ZMQ REQ/REP)
-DEFAULT_CONTROL_HZ = 15.0  # 机器人控制频率 (Hz)
-DEFAULT_ACTION_HORIZON = 32  # H: 模型输出 chunk 长度 (pi05_config.py 中为 32)
+DEFAULT_CONTROL_HZ = 15.0  # 机器人控制频率 (Hz), Δt = 20ms
+DEFAULT_ACTION_HORIZON = 32  # H: 模型输出 chunk 长度 (本项目实际为 32)
 DEFAULT_EXECUTION_HORIZON = 15  # s: 每执行 s 步触发新推理
-DEFAULT_RENDER_SIZE = 0  # 0 = 不缩放, 直接发送原始相机图像
+DEFAULT_RENDER_SIZE = 224  # 发送给策略的图像尺寸 (正方形)
 DEFAULT_INTERPOLATION_FACTOR = 10  # 插值倍率: 实际伺服频率 = control_hz × factor
-DEFAULT_MAX_ARM_VELOCITY = 3.0  # 单关节最大角速度 (rad/s); 兜底防跳变, ≤0 关闭
-DEFAULT_PROMPT = "fold the white T-shirt"
-
-# 观测键名 (与 examples/PI05/pi05_config.py 保持一致)
-VIDEO_KEY = "zed_rgb"
-STATE_KEY = "joints"
-ACTION_KEY = "joints"
-LANGUAGE_KEY = "annotation.human.task_description"
+# 例: 50Hz × 10 = 500Hz, 每对原始 action 之间插 8 个点
 
 # ┌──────────────────────────────────────────────────────────────────┐
 # │                  19 个关节的 PD 增益配置                         │
@@ -247,48 +147,36 @@ KD = [
 
 
 def _default_json_log_path() -> str:
-    """生成默认的 JSONL 日志路径, 带时间戳避免覆盖。"""
+    """生成默认的 JSONL 日志路径，带时间戳避免覆盖。"""
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    return str(Path.cwd() / "logs" / f"groot_rtc_trace_{timestamp}.jsonl")
-
-
-def _letterbox_resize(image: np.ndarray, size: int) -> np.ndarray:
-    """保持宽高比的 letterbox 缩放: 居中填零到 size×size。
-
-    输入 HWC uint8, 输出 (size, size, 3) uint8。客户端用纯 numpy 实现,
-    避免引入额外依赖 (cv2/Pillow)。
-    """
-    h, w = image.shape[:2]
-    if h == 0 or w == 0:
-        return np.zeros((size, size, 3), dtype=np.uint8)
-    scale = min(size / h, size / w)
-    new_h = max(1, int(round(h * scale)))
-    new_w = max(1, int(round(w * scale)))
-
-    # 最近邻缩放 (足够快; 若需更高质量可用 cv2.resize)
-    ys = (np.arange(new_h) * h / new_h).astype(np.int64)
-    xs = (np.arange(new_w) * w / new_w).astype(np.int64)
-    resized = image[ys[:, None], xs[None, :]]
-
-    canvas = np.zeros((size, size, 3), dtype=np.uint8)
-    y0 = (size - new_h) // 2
-    x0 = (size - new_w) // 2
-    canvas[y0 : y0 + new_h, x0 : x0 + new_w] = resized
-    return canvas
+    return str(Path.cwd() / "logs" / f"openpi_rtc_trace_{timestamp}.jsonl")
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  RTC 动作队列  (RTCActionQueue)
 # ═══════════════════════════════════════════════════════════════════
 #
-#  与 client_openpi.py 中的实现完全一致: 控制循环每个 tick 从队列头
-#  弹出一个动作; 推理线程在新 chunk 就绪后调用 merge() 将其融合进
-#  队列尾部 (frozen prefix + soft-mask blending)。
+#  核心数据结构。控制循环每个 tick 从队列头部弹出一个动作；推理线程
+#  在新 chunk 就绪后调用 merge() 将其融合进队列尾部。
+#
+#  融合流程 (merge):
+#
+#    旧队列剩余:  [prev_0, prev_1, ..., prev_{n-1}]
+#    新 chunk:     [new_0,  new_1,  ..., new_{H-1}]
+#
+#    重叠区域长度 overlap = min(n, H)
+#
+#    对于 i ∈ [0, overlap):
+#      若 i < d (冻结前缀):  blended[i] = prev[i]          权重 w=1
+#      若 i ∈ [d, overlap):  blended[i] = w·prev[i] + (1-w)·new[i]
+#                            w 按指数衰减从 1.0 → ~0
+#    对于 i ∈ [overlap, H):
+#      blended[i] = new[i]  (无旧数据, 直接使用新 chunk)
 #
 
 
 class RTCActionQueue:
-    """线程安全的 RTC 动作队列, 实现冻结前缀 + 软掩码融合。
+    """线程安全的 RTC 动作队列，实现冻结前缀 + 软掩码融合。
 
     术语 (与 RTC 论文一致):
       H  – action_horizon    模型输出的 chunk 总长度
@@ -337,10 +225,30 @@ class RTCActionQueue:
         blend_schedule: str = "exp",
         max_guidance_weight: float = 10.0,
     ) -> dict[str, Any]:
-        """将新 chunk 融合进队列, 返回融合诊断信息 (用于日志/可视化)。"""
+        """将新 chunk 融合进队列, 返回融合诊断信息 (用于日志/可视化)。
+
+        参数
+        ----
+        new_chunk : ndarray, shape (H, action_dim)
+            策略服务器返回的原始动作 chunk。
+        inference_delay : int
+            推理延迟 d (控制步数)。前 d 步被冻结为旧 chunk 对应值。
+        blend_schedule : str
+            "exp"    — 指数衰减 (推荐, 论文默认)
+            "linear" — 线性递减
+            "ones"   — 全部冻结 (重叠区域内完全使用旧 chunk)
+        max_guidance_weight : float
+            β: 融合权重裁剪上限, 控制指数衰减速率。
+
+        返回
+        ----
+        dict  包含 prev_left_over, blend_weights, raw_new_chunk 等诊断字段。
+        """
         with self._lock:
             # ① 取出旧队列剩余动作
-            prev_left = np.array(list(self._queue), dtype=np.float32) if self._queue else None
+            prev_left = (
+                np.array(list(self._queue), dtype=np.float32) if self._queue else None
+            )
             n_prev = len(prev_left) if prev_left is not None else 0
 
             # ② 计算重叠区域长度
@@ -361,13 +269,19 @@ class RTCActionQueue:
                 soft_len = overlap - frozen
                 if soft_len > 0:
                     if blend_schedule == "exp":
-                        decay_rate = math.log(max_guidance_weight + 1.0) / max(soft_len, 1)
+                        # 指数衰减: w(i) = exp(-λ·(i+1))
+                        # λ 选取使得 w(soft_len) ≈ 1/(β+1)
+                        decay_rate = math.log(max_guidance_weight + 1.0) / max(
+                            soft_len, 1
+                        )
                         for i in range(soft_len):
                             blend_weights[frozen + i] = math.exp(-decay_rate * (i + 1))
                     elif blend_schedule == "linear":
+                        # 线性递减: w(i) = 1 - (i+1)/(soft_len+1)
                         for i in range(soft_len):
                             blend_weights[frozen + i] = 1.0 - (i + 1) / (soft_len + 1)
                     elif blend_schedule == "ones":
+                        # 全部冻结 (不推荐, 反应性差)
                         blend_weights[frozen:] = 1.0
                     else:
                         raise ValueError(f"未知的 blend_schedule: {blend_schedule}")
@@ -377,7 +291,8 @@ class RTCActionQueue:
                 # 执行加权融合: blended = w * prev + (1-w) * new
                 for i in range(overlap):
                     blended[i] = (
-                        blend_weights[i] * prev_left[i] + (1.0 - blend_weights[i]) * new_chunk[i]
+                        blend_weights[i] * prev_left[i]
+                        + (1.0 - blend_weights[i]) * new_chunk[i]
                     )
 
                 # 替换队列
@@ -393,6 +308,7 @@ class RTCActionQueue:
             self._steps_since_last_merge = 0
             self._generation += 1
 
+            # 返回诊断信息, 供日志和可视化使用
             return {
                 "generation": self._generation,
                 "n_prev_left": n_prev,
@@ -420,8 +336,8 @@ class RTCActionQueue:
 # ═══════════════════════════════════════════════════════════════════
 
 
-class GrootAdamURTCClient(Node):
-    """ROS2 节点: 使用 RTC 驱动 Adam U 机器人 (GR00T 推理服务端)。
+class OpenPIAdamURTCClient(Node):
+    """ROS2 节点: 使用 RTC 驱动 Adam U 机器人。
 
     线程架构:
       ┌─────────────┐    ┌──────────────┐    ┌──────────────┐
@@ -434,7 +350,7 @@ class GrootAdamURTCClient(Node):
     """
 
     def __init__(self, args: argparse.Namespace) -> None:
-        super().__init__("groot_adam_u_rtc_client")
+        super().__init__("openpi_adam_u_rtc_client")
         self._args = args
         self._lock = threading.Lock()  # 保护传感器缓冲区和服务连接
         self._stop_event = threading.Event()  # 用于优雅退出所有线程
@@ -443,7 +359,7 @@ class GrootAdamURTCClient(Node):
         self._latest_low_state: np.ndarray | None = None  # 19 维关节角
         self._latest_hand_state: np.ndarray | None = None  # 2 维编码手部
         self._latest_state: np.ndarray | None = None  # 21 维拼接状态
-        self._latest_image: np.ndarray | None = None  # 预处理后图像 (HWC uint8)
+        self._latest_image: np.ndarray | None = None  # 预处理后图像
         self._latest_state_stamp: float | None = None  # 状态时间戳
         self._latest_image_stamp: float | None = None  # 图像时间戳
 
@@ -460,9 +376,12 @@ class GrootAdamURTCClient(Node):
         # ── 时间参数 ─────────────────────────────────────────────
         if args.control_hz <= 0.0:
             raise ValueError("control_hz 必须为正数。")
-        self._control_dt = 1.0 / args.control_hz  # 策略动作间隔 Δt (秒)
+        self._control_dt = 1.0 / args.control_hz  # 策略动作间隔 Δt (秒), 如 20ms
 
         # ── 插值参数 ─────────────────────────────────────────────
+        #  插值倍率 N: 每对原始动作之间插入 N-2 个中间点 + 两端共 N 个子步
+        #  实际伺服频率 = control_hz × N, 如 50×10 = 500Hz
+        #  伺服周期 servo_dt = control_dt / N, 如 20ms / 10 = 2ms
         self._interpolation_factor = max(1, int(args.interpolation_factor))
         self._servo_dt = self._control_dt / self._interpolation_factor
 
@@ -484,36 +403,30 @@ class GrootAdamURTCClient(Node):
         # ── 推理延迟 EMA 追踪器 (用于自动估算 d) ─────────────────
         self._infer_latency_ema = 0.0  # 秒, 指数移动平均
 
-        # ── 全局控制 tick 计数器 ────────────────────────────────
+        # ── 全局控制 tick 计数器 (用于日志中标注动作时间线) ────────
         self._control_tick = 0
 
-        # ── 输出层 slew-rate limiter (兜底防跳变) ─────────────────
-        #  限制单关节相对上次发布值的 delta ≤ max_arm_velocity × servo_dt。
-        #  ≤0 关闭限幅。
-        self._max_arm_velocity = float(args.max_arm_velocity)
-        self._max_arm_delta_per_tick = (
-            self._max_arm_velocity * self._servo_dt if self._max_arm_velocity > 0.0 else 0.0
-        )
-        self._last_published_arm: np.ndarray | None = None
-        self._slew_clamp_count = 0  # 累计被限幅的 servo tick 数
-        self._slew_total_count = 0  # 累计总 servo tick 数 (启用限幅后)
-        self._slew_window_clamps = 0
-        self._slew_window_total = 0
-        self._last_slew_log_time = 0.0
-        self._has_logged_first_slew_clamp = False
+        if OPENPI_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "openpi-client 不可用。请先安装：\n"
+                "  cd $OPENPI_ROOT/packages/openpi-client && pip install -e ."
+            ) from OPENPI_IMPORT_ERROR
 
         # ── ROS 发布器 / 订阅器 ──────────────────────────────────
         self._lowcmd_pub = self.create_publisher(LowCmd, args.lowcmd_topic, 10)
         self._handcmd_pub = self.create_publisher(HandCmd, args.handcmd_topic, 10)
 
         self.create_subscription(LowState, args.lowstate_topic, self._on_lowstate, 10)
-        self.create_subscription(HandState, args.handstate_topic, self._on_handstate, 10)
-        self.create_subscription(Image, args.camera_topic, self._on_image, qos_profile_sensor_data)
+        self.create_subscription(
+            HandState, args.handstate_topic, self._on_handstate, 10
+        )
+        self.create_subscription(
+            Image, args.camera_topic, self._on_image, qos_profile_sensor_data
+        )
 
         # 记录会话启动参数
         self._write_json_event(
             "session_start",
-            model="gr00t-n1d7-pi05",
             host=args.host,
             port=args.port,
             prompt=args.prompt,
@@ -523,9 +436,6 @@ class GrootAdamURTCClient(Node):
             blend_schedule=args.blend_schedule,
             max_guidance_weight=args.max_guidance_weight,
             interpolation_factor=args.interpolation_factor,
-            render_size=args.render_size,
-            max_arm_velocity=self._max_arm_velocity,
-            max_arm_delta_per_tick=self._max_arm_delta_per_tick,
         )
 
         # ── 启动工作线程 ─────────────────────────────────────────
@@ -535,19 +445,12 @@ class GrootAdamURTCClient(Node):
         self._start_connect_thread()
         self._start_worker_threads()
 
-        slew_str = (
-            f"slew={self._max_arm_velocity:.2f} rad/s "
-            f"(±{self._max_arm_delta_per_tick * 1000:.2f} mrad/tick)"
-            if self._max_arm_delta_per_tick > 0.0
-            else "slew=disabled"
-        )
         self.get_logger().info(
-            f"GR00T RTC 客户端已启动  H={args.action_horizon}  s={args.execution_horizon}  "
+            f"RTC 客户端已启动  H={args.action_horizon}  s={args.execution_horizon}  "
             f"control_hz={args.control_hz}  blend={args.blend_schedule}  "
             f"β={args.max_guidance_weight}  "
             f"interp={self._interpolation_factor}x → "
-            f"servo_hz={args.control_hz * self._interpolation_factor:.0f}  "
-            f"render_size={args.render_size}  {slew_str}"
+            f"servo_hz={args.control_hz * self._interpolation_factor:.0f}"
         )
 
     # ─────────────────────────────────────────────────────────────
@@ -618,28 +521,27 @@ class GrootAdamURTCClient(Node):
         if self._connect_thread is not None and self._connect_thread.is_alive():
             return
         self._connect_thread = threading.Thread(
-            target=self._connect_to_server, name="groot-connect", daemon=True
+            target=self._connect_to_server, name="openpi-connect", daemon=True
         )
         self._connect_thread.start()
 
     def _connect_to_server(self) -> None:
+        assert websocket_client_policy is not None
         while not self._stop_event.is_set():
             try:
                 self.get_logger().info(
-                    f"正在连接 GR00T 服务器 {self._args.host}:{self._args.port}..."
+                    f"正在连接 OpenPI 服务器 {self._args.host}:{self._args.port}..."
                 )
-                client = GrootZmqClient(
+                client = websocket_client_policy.WebsocketClientPolicy(
                     host=self._args.host,
                     port=self._args.port,
-                    timeout_ms=self._args.timeout_ms,
-                    api_token=self._args.api_token,
+                    api_key=self._args.api_key,
                 )
-                pong = client.ping()
-
+                metadata = client.get_server_metadata()
                 with self._lock:
                     self._policy_client = client
-                    self._server_metadata = {"ping": pong}
-                self.get_logger().info(f"已连接 GR00T 服务器: {pong}")
+                    self._server_metadata = metadata
+                self.get_logger().info(f"已连接: {metadata}")
                 return
             except Exception as exc:
                 self.get_logger().warning(f"连接失败: {exc}。5 秒后重试。")
@@ -654,13 +556,13 @@ class GrootAdamURTCClient(Node):
         """启动推理线程和控制线程 (各一个, 守护模式)。"""
         if self._infer_thread is None or not self._infer_thread.is_alive():
             self._infer_thread = threading.Thread(
-                target=self._infer_loop, name="groot-infer", daemon=True
+                target=self._infer_loop, name="openpi-infer", daemon=True
             )
             self._infer_thread.start()
 
         if self._control_thread is None or not self._control_thread.is_alive():
             self._control_thread = threading.Thread(
-                target=self._control_loop, name="groot-control", daemon=True
+                target=self._control_loop, name="openpi-control", daemon=True
             )
             self._control_thread.start()
 
@@ -688,6 +590,7 @@ class GrootAdamURTCClient(Node):
         """接收手部状态: 12 维原始值 → 2 维编码值 (左/右手各 0 或 1)。"""
         hand_positions = np.asarray(msg.position, dtype=np.float32)
         if hand_positions.shape[0] != HANDSTATE_RAW_DIM:
+            # 维度不匹配时补零
             padded = np.zeros((HANDSTATE_RAW_DIM,), dtype=np.float32)
             padded[: min(hand_positions.shape[0], HANDSTATE_RAW_DIM)] = hand_positions[
                 :HANDSTATE_RAW_DIM
@@ -703,7 +606,7 @@ class GrootAdamURTCClient(Node):
             self.get_logger().info("首次收到 handstate, 已编码为 2 维。")
 
     def _on_image(self, msg: Image) -> None:
-        """接收 ZED 相机图像: 解码 → (可选) 缩放 → 旋转180° → 存入缓冲区。"""
+        """接收 ZED 相机图像: 解码 → 缩放/填充 → 旋转180° → 存入缓冲区。"""
         try:
             image = self._decode_ros_image(msg)
             image = self._prepare_image(image)
@@ -717,7 +620,7 @@ class GrootAdamURTCClient(Node):
         if not self._has_logged_first_image:
             self._has_logged_first_image = True
             self.get_logger().info(
-                f"首次收到图像: {msg.encoding} {msg.width}×{msg.height} → {image.shape}"
+                f"首次收到图像: {msg.encoding} {msg.width}×{msg.height}"
             )
 
     # ─────────────────────────────────────────────────────────────
@@ -725,7 +628,12 @@ class GrootAdamURTCClient(Node):
     # ─────────────────────────────────────────────────────────────
 
     def _encode_hand_state(self, hand_positions: np.ndarray) -> np.ndarray:
-        """12 维原始手位 → 2 维归一化夹爪值 (二值化)。"""
+        """12 维原始手位 → 2 维归一化夹爪值。
+
+        每只手取前 5 个手指通道的均值, 除以 1800 归一化到 [0,1],
+        再二值化: >0.5 → 1.0 (张开), ≤0.5 → 0.0 (闭合)。
+        第 6 通道 (拇指旋转) 不参与编码, 解码时固定为 0。
+        """
         left_avg = np.mean(hand_positions[LEFT_HAND_SLICE][:5]) / 1800.0
         right_avg = np.mean(hand_positions[RIGHT_HAND_SLICE][:5]) / 1800.0
         return np.array(
@@ -740,15 +648,23 @@ class GrootAdamURTCClient(Node):
         """拼接 19 维关节角 + 2 维手部 → 21 维策略输入状态。"""
         if self._latest_low_state is None or self._latest_hand_state is None:
             return None
-        return np.concatenate([self._latest_low_state, self._latest_hand_state], axis=0).astype(
-            np.float32, copy=False
-        )
+        return np.concatenate(
+            [self._latest_low_state, self._latest_hand_state], axis=0
+        ).astype(np.float32, copy=False)
 
     def _decode_hand_action(self, hand_action: np.ndarray) -> np.ndarray:
-        """2 维归一化夹爪值 → 12 维手部指令。"""
+        """2 维归一化夹爪值 → 12 维手部指令。
+
+        策略输出 hand_action ∈ {0, 1}, 取反后:
+          - 1→闭合 映射为 position=1000
+          - 0→张开 映射为 position=0
+        前 5 通道为手指, 第 6 通道 (拇指旋转) 固定为 0。
+        """
         hand_cmd = np.zeros((HAND_CMD_DIM,), dtype=np.uint32)
         left_cmd = 1000 if float(np.clip(1.0 - hand_action[0], 0.0, 1.0)) > 0.5 else 500
-        right_cmd = 1000 if float(np.clip(1.0 - hand_action[1], 0.0, 1.0)) > 0.5 else 500
+        right_cmd = (
+            1000 if float(np.clip(1.0 - hand_action[1], 0.0, 1.0)) > 0.5 else 500
+        )
         hand_cmd[LEFT_HAND_SLICE][:4] = left_cmd
         hand_cmd[RIGHT_HAND_SLICE][:4] = right_cmd
         hand_cmd[LEFT_HAND_SLICE][4] = (
@@ -768,7 +684,9 @@ class GrootAdamURTCClient(Node):
     def _decode_ros_image(self, msg: Image) -> np.ndarray:
         """将 ROS Image 消息解码为 HWC uint8 RGB numpy 数组。"""
         encoding = msg.encoding.lower()
-        channels = {"rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4, "mono8": 1}.get(encoding)
+        channels = {"rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4, "mono8": 1}.get(
+            encoding
+        )
         if channels is None:
             raise ValueError(f"不支持的图像编码: {msg.encoding}")
 
@@ -776,12 +694,16 @@ class GrootAdamURTCClient(Node):
         expected_width = int(msg.width) * channels
         flat = np.frombuffer(msg.data, dtype=np.uint8)
         image = flat.reshape((int(msg.height), row_stride))
-        image = image[:, :expected_width].reshape((int(msg.height), int(msg.width), channels))
+        image = image[:, :expected_width].reshape(
+            (int(msg.height), int(msg.width), channels)
+        )
 
+        # 颜色通道转换: BGR→RGB, BGRA→RGBA→RGB
         if encoding == "bgr8":
             image = image[:, :, ::-1]
         elif encoding == "bgra8":
             image = image[:, :, [2, 1, 0, 3]]
+        # 单通道 → 三通道; 四通道 → 丢弃 alpha
         if channels == 1:
             image = np.repeat(image, 3, axis=2)
         elif channels == 4:
@@ -789,100 +711,29 @@ class GrootAdamURTCClient(Node):
         return np.ascontiguousarray(image)
 
     def _prepare_image(self, image: np.ndarray) -> np.ndarray:
-        """旋转 180°; 当 render_size>0 时额外做 letterbox 缩放。
-
-        GR00T 服务端的 processor 内部会再次 resize, 因此默认 (render_size=0)
-        直接发送原始相机分辨率的 HWC uint8 图像即可, 不需要额外预处理。
-        """
-        if self._args.render_size and self._args.render_size > 0:
-            image = _letterbox_resize(image, int(self._args.render_size))
-        image = np.rot90(image, 2)  # 旋转 180° (相机倒装)
-        return np.ascontiguousarray(image, dtype=np.uint8)
+        """缩放+填充到 render_size × render_size, 旋转180°, 可选转置为 CHW。"""
+        assert image_tools is not None
+        resized = image_tools.convert_to_uint8(
+            image_tools.resize_with_pad(
+                image, self._args.render_size, self._args.render_size
+            )
+        )
+        resized = np.rot90(resized, 2)  # 旋转 180° (相机倒装)
+        if self._args.image_layout == "chw":
+            return np.transpose(resized, (2, 0, 1))
+        return resized
 
     # ─────────────────────────────────────────────────────────────
     #  动作执行
     # ─────────────────────────────────────────────────────────────
-
-    def _slew_limit_arm(self, target_arm: np.ndarray) -> np.ndarray:
-        """对 19 维手臂动作做 per-tick 滑率限幅, 兜底防止跳变。
-
-        - 单关节相对上一次发布值的 |Δq| ≤ ``max_arm_velocity × servo_dt``
-        - 首次调用从当前关节状态 ``_latest_low_state`` 锚定起点 (避免开机瞬跳)
-        - 限幅是闭环式: 下一次的 ``last`` 是被限幅后的指令值, 因此即使输入持续
-          偏离, 输出也只会以最大斜率追上, 不会突变
-        - ``max_arm_velocity ≤ 0`` 时直接透传 (停用限幅)
-        """
-        if self._max_arm_delta_per_tick <= 0.0:
-            return target_arm
-
-        # 首次进入: 用当前真实关节角作锚, 避免第一帧就跳
-        if self._last_published_arm is None:
-            with self._lock:
-                anchor = (
-                    self._latest_low_state.copy() if self._latest_low_state is not None else None
-                )
-            self._last_published_arm = (
-                anchor.astype(np.float32, copy=False)
-                if anchor is not None
-                else target_arm.astype(np.float32, copy=True)
-            )
-
-        delta = target_arm.astype(np.float32, copy=False) - self._last_published_arm
-        max_d = self._max_arm_delta_per_tick
-        clamped_delta = np.clip(delta, -max_d, max_d)
-
-        # 诊断: 统计有多少 tick 触发了限幅
-        was_clamped = bool(np.any(np.abs(delta) > max_d + 1e-9))
-        self._slew_total_count += 1
-        self._slew_window_total += 1
-        if was_clamped:
-            self._slew_clamp_count += 1
-            self._slew_window_clamps += 1
-            if not self._has_logged_first_slew_clamp:
-                self._has_logged_first_slew_clamp = True
-                self.get_logger().warning(
-                    f"slew limiter 首次触发: max|Δ|={float(np.max(np.abs(delta))):.4f} rad "
-                    f"→ clipped to ±{max_d:.4f} rad/tick "
-                    f"(tick={self._control_tick})"
-                )
-
-        # 每 5 秒打印一次窗口内的限幅频率 (>0.5% 才提示)
-        now = time.time()
-        if now - self._last_slew_log_time >= 5.0 and self._slew_window_total > 0:
-            rate = 100.0 * self._slew_window_clamps / self._slew_window_total
-            if rate > 0.5:
-                self.get_logger().warning(
-                    f"slew limiter active: {rate:.1f}% "
-                    f"({self._slew_window_clamps}/{self._slew_window_total} ticks last 5s) "
-                    f"— policy 输出存在跳变, 已被卡到 ±{max_d:.4f} rad/tick"
-                )
-            self._slew_window_clamps = 0
-            self._slew_window_total = 0
-            self._last_slew_log_time = now
-
-        new_arm = (self._last_published_arm + clamped_delta).astype(np.float32)
-        self._last_published_arm = new_arm
-        return new_arm
 
     def _apply_action(self, action: np.ndarray) -> None:
         """将 21 维策略动作拆分为 lowcmd (19维) + handcmd (12维) 并发布。"""
         if action.shape[0] < ACTION_DIM:
             raise ValueError(f"动作维度 {action.shape[0]} < {ACTION_DIM}")
 
-        arm_action = np.asarray(action[:ACTION_ARM_DIM], dtype=np.float32).copy()
+        arm_action = action[:ACTION_ARM_DIM]
         hand_action = action[ACTION_ARM_DIM:ACTION_DIM]
-
-        # ── 硬安全限位 (先于 slew, 这样 slew 追踪的是真实发布值) ──
-        # 腰部 pitch (索引1) 限制最大前倾角度
-        if arm_action[1] > 0.5:
-            arm_action[1] = 0.5
-        # 颈部 yaw (索引3) 固定为 0 (不转头)
-        arm_action[3] = 0.0
-        # 颈部 pitch (索引4) 固定低头 45° (看桌面)
-        arm_action[4] = 45.0 / 180.0 * math.pi
-
-        # ── 输出层兜底: 关节滑率限幅 ──
-        arm_action = self._slew_limit_arm(arm_action)
 
         # 构建关节指令
         lowcmd = LowCmd()
@@ -890,18 +741,27 @@ class GrootAdamURTCClient(Node):
         for idx, target_q in enumerate(arm_action):
             mc = lowcmd.motor_cmd[idx]
             mc.mode = 1  # 位置控制模式
-            mc.q = float(target_q)
-            mc.dq = 0.0
-            mc.tau = 0.0
-            mc.kp = KP[idx]
-            mc.kd = KD[idx]
-            mc.ki = 0.0
+            mc.q = float(target_q)  # 目标角度 (rad)
+            mc.dq = 0.0  # 目标角速度
+            mc.tau = 0.0  # 前馈力矩
+            mc.kp = KP[idx]  # 比例增益
+            mc.kd = KD[idx]  # 微分增益
+            mc.ki = 0.0  # 积分增益 (未使用)
 
         # 构建手部指令
         hand_positions = self._decode_hand_action(hand_action)
         handcmd = HandCmd()
         for idx in range(HAND_CMD_DIM):
             handcmd.position[idx] = int(hand_positions[idx])
+
+        # ── 安全限位 ──
+        # 腰部 pitch (索引1) 限制最大前倾角度
+        if lowcmd.motor_cmd[1].q > 0.5:
+            lowcmd.motor_cmd[1].q = 0.5
+        # 颈部 yaw (索引3) 固定为 0 (不转头)
+        lowcmd.motor_cmd[3].q = 0.0
+        # 颈部 pitch (索引4) 固定低头 45° (看桌面)
+        lowcmd.motor_cmd[4].q = 45.0 / 180.0 * math.pi
 
         if not self._debug:
             self._lowcmd_pub.publish(lowcmd)
@@ -938,46 +798,22 @@ class GrootAdamURTCClient(Node):
             self.get_logger().info(f"等待中: {', '.join(missing)}")
             self._last_wait_log_time = now
 
-    # ─────────────────────────────────────────────────────────────
-    #  观测构造  (GR00T 协议: 必须包含 batch + temporal 维度)
-    # ─────────────────────────────────────────────────────────────
-
-    def _build_observation(self, state: np.ndarray, image: np.ndarray) -> dict[str, Any]:
-        """构造符合 Gr00tPolicy.check_observation 要求的批量观测字典。
-
-        参考 gr00t/policy/gr00t_policy.py:208-369 的形状契约:
-          - video[zed_rgb]:   uint8   (B=1, T=1, H, W, 3)
-          - state[joints]:    float32 (B=1, T=1, 21)
-          - language[...]:    list[list[str]]  (B=1, T=1)
-        """
-        if image.ndim != 3 or image.shape[-1] != 3:
-            raise ValueError(f"image 必须为 (H, W, 3), got {image.shape}")
-        if state.ndim != 1 or state.shape[0] < STATE_DIM:
-            raise ValueError(f"state 必须 ≥ {STATE_DIM}, got {state.shape}")
-
-        video_arr = np.ascontiguousarray(image, dtype=np.uint8)[None, None]  # (1,1,H,W,3)
-        state_arr = state[:STATE_DIM].astype(np.float32, copy=False)[None, None]  # (1,1,D)
-        return {
-            "video": {VIDEO_KEY: video_arr},
-            "state": {STATE_KEY: state_arr},
-            "language": {LANGUAGE_KEY: [[self._args.prompt]]},
-        }
-
     # ═════════════════════════════════════════════════════════════
     #  推理线程  (RTC: 异步, 由 execution_horizon 触发)
     # ═════════════════════════════════════════════════════════════
     #
     #  执行流程:
+    #
     #    while not stopped:
     #      ① 检查传感器和服务器是否就绪
     #      ② 等待控制循环消耗 s 步 (或队列为空)
     #      ③ 拍下最新观测快照 (state + image)
-    #      ④ 调用 GR00T 服务器推理 (GrootZmqClient.get_action, 阻塞)
+    #      ④ 调用远程 OpenPI 服务器推理 (阻塞, 耗时 ~100-200ms)
     #      ⑤ 计算推理延迟 d = ceil(latency / Δt) 步
     #      ⑥ 将新 chunk 通过 merge() 融合进动作队列
     #
     #  关键: 步骤 ④ 执行期间, 控制线程仍在持续弹出旧动作并执行,
-    #        机器人不会暂停。
+    #        机器人不会暂停。这就是 RTC 的"异步"核心。
 
     def _infer_loop(self) -> None:
         """推理线程主循环。"""
@@ -985,8 +821,12 @@ class GrootAdamURTCClient(Node):
             # ① 检查就绪状态
             with self._lock:
                 client = self._policy_client
-                state = None if self._latest_state is None else self._latest_state.copy()
-                image = None if self._latest_image is None else self._latest_image.copy()
+                state = (
+                    None if self._latest_state is None else self._latest_state.copy()
+                )
+                image = (
+                    None if self._latest_image is None else self._latest_image.copy()
+                )
 
             if client is None or state is None or image is None:
                 self._maybe_log_waiting(client, state, image)
@@ -994,19 +834,27 @@ class GrootAdamURTCClient(Node):
                 continue
 
             # ② 等待队列需要补充
+            #    首次 (队列为空) 或已消耗 s 步时立即触发
             while not self._stop_event.is_set():
-                if len(self._action_queue) == 0 or self._action_queue.should_request_new_chunk():
+                if (
+                    len(self._action_queue) == 0
+                    or self._action_queue.should_request_new_chunk()
+                ):
                     break
                 self._stop_event.wait(0.002)  # 2ms 轮询
 
             if self._stop_event.is_set():
                 break
 
-            # ③ 推理前再次拍下最新观测
+            # ③ 推理前再次拍下最新观测 (尽量新鲜)
             with self._lock:
                 client = self._policy_client
-                state = None if self._latest_state is None else self._latest_state.copy()
-                image = None if self._latest_image is None else self._latest_image.copy()
+                state = (
+                    None if self._latest_state is None else self._latest_state.copy()
+                )
+                image = (
+                    None if self._latest_image is None else self._latest_image.copy()
+                )
 
             if client is None or state is None or image is None:
                 continue
@@ -1017,25 +865,20 @@ class GrootAdamURTCClient(Node):
     def _run_inference(self, client: Any, state: np.ndarray, image: np.ndarray) -> None:
         """单次推理: 调用服务器 → 融合新 chunk → 写日志。"""
         try:
-            observation = self._build_observation(state, image)
+            observation = {
+                "state": state,
+                "images": {"cam_high": image},
+                "prompt": self._args.prompt,
+            }
 
             # ④ 远程推理 (阻塞)
             t0 = time.perf_counter()
-            action_dict, _info = client.get_action(observation)
+            result = client.infer(observation)
             elapsed = time.perf_counter() - t0
 
-            if not isinstance(action_dict, dict) or ACTION_KEY not in action_dict:
-                raise ValueError(
-                    f"服务器返回缺少键 '{ACTION_KEY}': {list(action_dict)[:5] if isinstance(action_dict, dict) else type(action_dict)}"
-                )
-
-            actions = np.asarray(action_dict[ACTION_KEY], dtype=np.float32)
-
-            # GR00T 输出 shape (B=1, T, D); 移除 batch 维
-            if actions.ndim == 3:
-                actions = actions[0]
+            actions = np.asarray(result.get("actions"), dtype=np.float32)
             if actions.ndim != 2 or actions.size == 0:
-                raise ValueError(f"服务器返回了无效的动作张量, shape={actions.shape}")
+                raise ValueError("服务器返回了空的动作张量。")
             if actions.shape[-1] < ACTION_DIM:
                 raise ValueError(f"动作维度 {actions.shape[-1]} < {ACTION_DIM}")
 
@@ -1043,9 +886,12 @@ class GrootAdamURTCClient(Node):
             H = min(actions.shape[0], self._args.action_horizon)
             action_chunk = actions[:H, :ACTION_DIM].copy()
 
-            # ⑤ 计算推理延迟 d (控制步数), EMA 平滑
+            # ⑤ 计算推理延迟 d (控制步数)
+            #    使用 EMA 平滑, 避免单次波动导致 d 跳变
             alpha = 0.3
-            self._infer_latency_ema = alpha * elapsed + (1.0 - alpha) * self._infer_latency_ema
+            self._infer_latency_ema = (
+                alpha * elapsed + (1.0 - alpha) * self._infer_latency_ema
+            )
             d = max(1, int(math.ceil(self._infer_latency_ema / self._control_dt)))
 
             # ⑥ 融合进动作队列
@@ -1056,6 +902,7 @@ class GrootAdamURTCClient(Node):
                 max_guidance_weight=self._args.max_guidance_weight,
             )
 
+            # 写入详细日志 (可视化脚本依赖这些字段)
             self._write_json_event(
                 "rtc_inference",
                 generation=merge_info["generation"],
@@ -1081,23 +928,6 @@ class GrootAdamURTCClient(Node):
                 f"queue={merge_info['queue_len_after']}  gen={merge_info['generation']}  "
                 f"action_range=[{action_chunk.min():.3f}, {action_chunk.max():.3f}]"
             )
-
-            # ── RTC 健康度自检 ──
-            #   要求 frozen 区域之外仍有混合空间, 否则 chunk 边界会出现硬切。
-            #   safe: s ≤ H - 2d - min_blend ; 这里取 min_blend = 4。
-            n_prev = merge_info["n_prev_left"]
-            soft_len = max(0, merge_info["overlap"] - merge_info["frozen_steps"])
-            if soft_len < 2:
-                blend_room_needed = self._args.execution_horizon + 2 * d + 4
-                self.get_logger().warning(
-                    f"⚠️  RTC 边界硬切风险: n_prev={n_prev} d={d} → "
-                    f"soft_len={soft_len} (无平滑混合区). "
-                    f"建议: 1) 把 --execution-horizon 降到 ≤ {max(1, self._args.action_horizon - 2 * d - 4)} "
-                    f"(当前 {self._args.execution_horizon}, 需要 {blend_room_needed} 步空间但 H 只有 "
-                    f"{self._args.action_horizon}); 2) 或把服务端推理延迟从 "
-                    f"{self._infer_latency_ema * 1000:.0f}ms 降到 ≤ "
-                    f"{(self._args.action_horizon - self._args.execution_horizon - 4) * self._control_dt * 1000:.0f}ms"
-                )
         except Exception as exc:
             self.get_logger().warning(f"推理失败: {exc}")
             with self._lock:
@@ -1109,11 +939,25 @@ class GrootAdamURTCClient(Node):
     #  控制线程  (含插值, 以 servo_hz 频率发送指令)
     # ═════════════════════════════════════════════════════════════
     #
-    #  外层按 control_dt 从队列弹出新动作, 内层按 servo_dt 在相邻两帧
-    #  之间线性插值并发布。手部动作为二值 (0/1), 不插值, 直接持有新值。
+    #  时序示意 (以 control_hz=50, interpolation_factor=10 为例):
+    #
+    #    策略动作:     a[0]          a[1]          a[2]    ...
+    #    时间轴:       |----20ms-----|----20ms-----|
+    #    伺服指令:     s0 s1 ... s9  s10 s11...s19
+    #                  |--2ms--|     |--2ms--|
+    #
+    #    s_k = lerp(a[i], a[i+1], t)   其中 t = (k+1) / factor
+    #    k=0 → t=0.1 (接近 a[i])
+    #    k=9 → t=1.0 (到达 a[i+1])
+    #
+    #  手部动作为二值 (0/1), 不做线性插值, 直接持有新值。
 
     def _control_loop(self) -> None:
-        """控制线程主循环: 以 servo_hz 频率发送插值后的指令。"""
+        """控制线程主循环: 以 servo_hz 频率发送插值后的指令。
+
+        外层按 control_dt (50Hz) 从队列弹出新动作,
+        内层按 servo_dt (500Hz) 在相邻两帧之间线性插值并发布。
+        """
         factor = self._interpolation_factor
         prev_action: np.ndarray | None = None  # 上一个原始动作
         curr_action: np.ndarray | None = None  # 当前原始动作
@@ -1125,9 +969,10 @@ class GrootAdamURTCClient(Node):
             new_action = self._action_queue.get()
 
             if new_action is not None:
-                prev_action = curr_action
+                prev_action = curr_action  # 保存旧的作为插值起点
                 curr_action = new_action
 
+                # 日志: 记录原始 (未插值) 动作 (可视化脚本依赖)
                 self._write_json_event(
                     "control_action",
                     generation=self._action_queue.generation,
@@ -1136,6 +981,7 @@ class GrootAdamURTCClient(Node):
                     output_action=curr_action,
                 )
 
+                # Debug 模式: 按原始控制频率 (非插值频率) 打印动作信息
                 if self._debug:
                     arm = curr_action[:ACTION_ARM_DIM]
                     hand = curr_action[ACTION_ARM_DIM:ACTION_DIM]
@@ -1151,6 +997,7 @@ class GrootAdamURTCClient(Node):
             self._control_tick += 1
 
             if curr_action is None:
+                # 队列空, 等一个 control_dt 再试
                 next_servo_deadline += self._control_dt
                 self._sleep_until(next_servo_deadline)
                 continue
@@ -1161,13 +1008,22 @@ class GrootAdamURTCClient(Node):
                     break
 
                 if prev_action is None:
+                    # 首个动作, 无法插值 → 直接发送当前动作
                     interp_action = curr_action
                 else:
+                    # t ∈ (0, 1]:  t=1/F ... F/F
+                    # sub=0 → t=1/F (靠近 prev);  sub=F-1 → t=1.0 (到达 curr)
                     t = (sub + 1) / factor
+
+                    # 手臂关节 (前 19 维): 线性插值
                     interp_arm = (
-                        prev_action[:ACTION_ARM_DIM] * (1.0 - t) + curr_action[:ACTION_ARM_DIM] * t
+                        prev_action[:ACTION_ARM_DIM] * (1.0 - t)
+                        + curr_action[:ACTION_ARM_DIM] * t
                     )
+
+                    # 手部 (后 2 维): 二值, 不插值, 直接使用新值
                     interp_hand = curr_action[ACTION_ARM_DIM:ACTION_DIM]
+
                     interp_action = np.concatenate([interp_arm, interp_hand])
 
                 self._apply_action(interp_action)
@@ -1183,28 +1039,14 @@ class GrootAdamURTCClient(Node):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Adam U ROS2 GR00T 客户端 (RTC 实时分块版, PI05 微调模型)"
+        description="Adam U ROS2 OpenPI 客户端 (RTC 实时分块版)"
     )
-    p.add_argument("--host", default=DEFAULT_HOST, help="GR00T 推理服务器地址。")
-    p.add_argument("--port", type=int, default=DEFAULT_PORT, help="GR00T 推理服务器端口 (ZMQ)。")
+    p.add_argument("--host", default="192.168.31.116", help="OpenPI 策略服务器地址。")
+    p.add_argument("--port", type=int, default=8000, help="OpenPI 策略服务器端口。")
+    p.add_argument("--api-key", default=None, help="可选的 API 密钥。")
     p.add_argument(
-        "--api-token",
-        default=None,
-        help="可选的 API token (与 PolicyServer.api_token 对应)。",
+        "--prompt", default="fold the white T-shirt", help="发送给策略的自然语言指令。"
     )
-    p.add_argument(
-        "--api-key",
-        default=None,
-        dest="api_token",
-        help="兼容旧名: --api-key 等价于 --api-token。",
-    )
-    p.add_argument(
-        "--timeout-ms",
-        type=int,
-        default=15000,
-        help="ZMQ REQ socket 收发超时 (毫秒), 默认 15s。",
-    )
-    p.add_argument("--prompt", default=DEFAULT_PROMPT, help="发送给策略的自然语言指令。")
 
     # ROS 话题
     p.add_argument("--camera-topic", default=DEFAULT_CAMERA_TOPIC)
@@ -1224,13 +1066,13 @@ def parse_args() -> argparse.Namespace:
         "--action-horizon",
         type=int,
         default=DEFAULT_ACTION_HORIZON,
-        help="H: 模型输出的 chunk 总长度 (PI05 默认 32)。",
+        help="H: 模型输出的 chunk 总长度 (本项目 H=32)。",
     )
     p.add_argument(
         "--execution-horizon",
         type=int,
         default=DEFAULT_EXECUTION_HORIZON,
-        help="s: 每消耗 s 步请求新 chunk (默认 15)。",
+        help="s: 每消耗 s 步请求新 chunk (默认 10)。",
     )
     p.add_argument(
         "--blend-schedule",
@@ -1248,16 +1090,10 @@ def parse_args() -> argparse.Namespace:
         "--interpolation-factor",
         type=int,
         default=DEFAULT_INTERPOLATION_FACTOR,
-        help="插值倍率 N: 伺服频率 = control_hz × N。设为 1 则关闭插值。",
-    )
-    p.add_argument(
-        "--max-arm-velocity",
-        type=float,
-        default=DEFAULT_MAX_ARM_VELOCITY,
-        help="输出层关节滑率限幅 (rad/s)。每个 servo tick 单关节 |Δq| 最大 = "
-        "max_arm_velocity / (control_hz × interpolation_factor)。默认 3.0 rad/s "
-        "(≈172°/s) — 足以覆盖正常 manipulation, 但能兜住模型的异常跳变。"
-        "≤0 则关闭限幅。手部二值动作不受影响。",
+        help="插值倍率 N: 伺服频率 = control_hz × N。"
+        "每对原始动作之间插入 N-2 个中间点 + 两端 = N 个子步。"
+        "例: N=10, 50Hz→500Hz, 每 20ms 内发 10 条指令。"
+        "手部二值动作不插值。设为 1 则关闭插值。",
     )
 
     # 图像
@@ -1265,8 +1101,13 @@ def parse_args() -> argparse.Namespace:
         "--render-size",
         type=int,
         default=DEFAULT_RENDER_SIZE,
-        help="客户端预 letterbox 缩放尺寸 (正方形)。0 = 不缩放, 直接发原图; "
-        "GR00T 服务端 processor 会自动 resize, 一般保持默认即可。",
+        help="发送给策略的图像尺寸 (正方形)。",
+    )
+    p.add_argument(
+        "--image-layout",
+        choices=("chw", "hwc"),
+        default="chw",
+        help="图像布局: chw (PyTorch) 或 hwc (TensorFlow)。",
     )
 
     # 杂项
@@ -1292,11 +1133,11 @@ def main() -> None:
     os.environ["ROS_DOMAIN_ID"] = str(args.ros_domain_id)
 
     rclpy.init()
-    node = GrootAdamURTCClient(args)
+    node = OpenPIAdamURTCClient(args)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        logging.info("正在关闭 GR00T RTC 客户端。")
+        logging.info("正在关闭 RTC 客户端。")
     finally:
         try:
             node.destroy_node()

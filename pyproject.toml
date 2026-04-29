@@ -140,10 +140,10 @@ split-on-trailing-comma = false
 lines-after-imports = 2
 section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
 
-[[tool.uv.index]]
-name = "nvidia-pypi"
-url = "https://pypi.nvidia.com"
-explicit = true
+# [[tool.uv.index]]
+# name = "nvidia-pypi"
+# url = "https://pypi.nvidia.com"
+# explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

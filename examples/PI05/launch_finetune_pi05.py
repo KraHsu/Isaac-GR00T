@@ -40,6 +40,7 @@ config.model.reproject_vision = False
 config.model.model_name = "nvidia/Cosmos-Reason2-2B"
 config.model.backbone_trainable_params_fp32 = True
 config.model.use_relative_action = True
+config.model.action_horizon = 64
 config.model.color_jitter_params = {
     "brightness": 0.3, "contrast": 0.4, "saturation": 0.5, "hue": 0.08
 }
